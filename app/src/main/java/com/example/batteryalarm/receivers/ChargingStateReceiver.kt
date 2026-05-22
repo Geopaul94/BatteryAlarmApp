@@ -41,7 +41,7 @@ class ChargingStateReceiver : BroadcastReceiver() {
         val immediateCheckRequest = OneTimeWorkRequestBuilder<BatteryMonitorWorker>()
             .setConstraints(
                 Constraints.Builder()
-                    .setRequiredNetworkType(NetworkType.NONE)
+                    .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
                     .build()
             )
             .build()

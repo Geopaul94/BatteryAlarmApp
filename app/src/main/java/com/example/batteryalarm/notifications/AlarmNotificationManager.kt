@@ -1,5 +1,6 @@
 package com.example.batteryalarm.notifications
 
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -159,7 +160,7 @@ class AlarmNotificationManager @Inject constructor(
         title: String,
         message: String,
         pattern: LongArray
-    ): NotificationCompat.Notification {
+    ): Notification {
         val intent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         }

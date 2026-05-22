@@ -52,7 +52,7 @@ class BatteryRepositoryImpl @Inject constructor(
         ).setConstraints(
             Constraints.Builder()
                 .setRequiresBatteryNotLow(false) // Monitor even when battery is low
-                .setRequiredNetworkType(NetworkType.NONE) // No network needed
+                .setRequiredNetworkType(NetworkType.NOT_REQUIRED) // No network needed
                 .build()
         ).build()
 

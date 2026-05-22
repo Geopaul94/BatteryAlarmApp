@@ -33,7 +33,7 @@ class BatteryDataSource @Inject constructor(
                 status == BatteryManager.BATTERY_STATUS_FULL
 
         val plugged = batteryStatus.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1)
-        val isPlugged = plugged != BatteryManager.BATTERY_PLUGGED_NONE && plugged > 0
+        val isPlugged = plugged > 0
 
         val temperature = batteryStatus.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) / 10
 

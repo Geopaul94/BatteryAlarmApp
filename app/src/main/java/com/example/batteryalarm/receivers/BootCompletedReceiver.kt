@@ -33,7 +33,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
         ).setConstraints(
             Constraints.Builder()
                 .setRequiresBatteryNotLow(false)
-                .setRequiredNetworkType(NetworkType.NONE)
+                .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
                 .build()
         ).build()
 
