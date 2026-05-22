@@ -6,21 +6,23 @@ import kotlinx.coroutines.flow.Flow
 
 /**
  * Repository interface for battery-related data operations
- * Abstraction layer between data sources and presentation
  */
 interface BatteryRepository {
-    // Observe current battery state changes
+    /** Real-time battery state — emits on every battery change */
     fun getBatteryStateFlow(): Flow<BatteryState>
 
-    // Observe alarm events
+    /** One-time alarm events (80%, 20%, charger check) */
     fun getAlarmEventFlow(): Flow<BatteryAlarmEvent>
 
-    // Start monitoring battery (starts WorkManager and receivers)
+    /** Schedule WorkManager periodic monitoring */
     suspend fun startMonitoring()
 
-    // Stop monitoring battery
+    /** Cancel WorkManager monitoring */
     suspend fun stopMonitoring()
 
-    // Get current battery state snapshot
+    /** Snapshot of current battery state */
     suspend fun getCurrentBatteryState(): BatteryState
+
+    /** Check state against alarm thresholds and emit events if triggered */
+    suspend fun checkAndEmitAlarms(state: BatteryState)
 }

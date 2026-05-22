@@ -1,6 +1,9 @@
 package com.example.batteryalarm.data.repository
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.NetworkType
@@ -12,18 +15,22 @@ import com.example.batteryalarm.domain.model.BatteryState
 import com.example.batteryalarm.domain.repository.BatteryRepository
 import com.example.batteryalarm.workers.BatteryMonitorWorker
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.callbackFlow
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
  * Implementation of BatteryRepository
- * Responsibility: Combine data sources and expose as Flows for UI
+ *
+ * KEY FIX: Uses callbackFlow + BroadcastReceiver for ACTION_BATTERY_CHANGED
+ * so the UI gets LIVE battery updates every time battery state changes —
+ * not just every 15 minutes from WorkManager.
  */
 @Singleton
 class BatteryRepositoryImpl @Inject constructor(
@@ -31,28 +38,58 @@ class BatteryRepositoryImpl @Inject constructor(
     private val batteryDataSource: BatteryDataSource
 ) : BatteryRepository {
 
-    private val _batteryStateFlow = MutableStateFlow(BatteryState())
+    // Alarm events stay as SharedFlow (one-time events)
     private val _alarmEventFlow = MutableSharedFlow<BatteryAlarmEvent>()
+    override fun getAlarmEventFlow(): Flow<BatteryAlarmEvent> = _alarmEventFlow.asSharedFlow()
 
     // Track previous state to avoid duplicate alarms
-    private var previousBatteryPercentage = 0
-    private var previousCharging = false
+    private var previousBatteryPercentage = -1
     private var previousPlugged = false
     private var chargerPluggedTime = 0L
 
-    override fun getBatteryStateFlow(): Flow<BatteryState> = _batteryStateFlow.asStateFlow()
+    /**
+     * REAL-TIME battery state using callbackFlow + BroadcastReceiver.
+     *
+     * How it works:
+     * 1. Registers a BroadcastReceiver for ACTION_BATTERY_CHANGED
+     * 2. Every time battery level, charging status, or temperature changes
+     *    → Android fires the broadcast → we read new state → emit to Flow
+     * 3. On first subscription, immediately emits the current battery state
+     * 4. When no one is collecting (UI destroyed), auto-unregisters receiver
+     */
+    override fun getBatteryStateFlow(): Flow<BatteryState> = callbackFlow {
 
-    override fun getAlarmEventFlow(): Flow<BatteryAlarmEvent> = _alarmEventFlow.asSharedFlow()
+        // This receiver fires every time battery changes
+        val batteryReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val state = batteryDataSource.getBatteryState()
+                trySend(state) // Push new state into the Flow
+            }
+        }
+
+        // Register receiver to listen for battery changes
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        context.registerReceiver(batteryReceiver, filter)
+
+        // Emit current state IMMEDIATELY so UI doesn't show blank/default values
+        val initialState = batteryDataSource.getBatteryState()
+        trySend(initialState)
+
+        // When the collector (ViewModel) stops collecting, unregister receiver
+        awaitClose {
+            context.unregisterReceiver(batteryReceiver)
+        }
+    }
 
     override suspend fun startMonitoring() {
-        // Schedule periodic battery monitoring worker (every 5 minutes)
+        // WorkManager for background periodic alarm checks (every 15 min)
+        // callbackFlow above handles real-time UI updates
         val batteryMonitorRequest = PeriodicWorkRequestBuilder<BatteryMonitorWorker>(
-            15, // interval
-            TimeUnit.MINUTES // period
+            15, TimeUnit.MINUTES
         ).setConstraints(
             Constraints.Builder()
-                .setRequiresBatteryNotLow(false) // Monitor even when battery is low
-                .setRequiredNetworkType(NetworkType.NOT_REQUIRED) // No network needed
+                .setRequiresBatteryNotLow(false)
+                .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
                 .build()
         ).build()
 
@@ -68,67 +105,56 @@ class BatteryRepositoryImpl @Inject constructor(
     }
 
     override suspend fun getCurrentBatteryState(): BatteryState {
-        return batteryDataSource.getBatteryState().also {
-            _batteryStateFlow.emit(it)
-            checkAndEmitAlarms(it)
-        }
+        return batteryDataSource.getBatteryState()
     }
 
     /**
-     * Called by WorkManager to check battery and emit alarms
-     * Also exposed for testing and manual updates
+     * Called by WorkManager periodically — checks alarms only
+     * (UI updates happen in real-time via getBatteryStateFlow above)
      */
     suspend fun updateBatteryState() {
         val currentState = batteryDataSource.getBatteryState()
-        _batteryStateFlow.emit(currentState)
         checkAndEmitAlarms(currentState)
     }
 
     /**
-     * Check for alarm conditions and emit alarm events
+     * Check alarm conditions and emit events when thresholds are crossed.
+     *
      * Rules:
-     * - 80% alarm: Battery >= 80% AND charging AND wasn't already at 80%
-     * - 20% alarm: Battery <= 20% AND not charging AND wasn't already at 20%
-     * - Check switch alarm: Plugged but not charging for 15 seconds
+     * - 80% alarm : reaches 80% while charging (only fires once when crossing)
+     * - 20% alarm : drops to 20% while NOT charging (only fires once when crossing)
+     * - Charger check : plugged in but not charging after 15 seconds
      */
-    private suspend fun checkAndEmitAlarms(state: BatteryState) {
-        // 80% alarm - only when actively charging
-        if (state.batteryPercentage >= 80 &&
-            state.isCharging &&
-            previousBatteryPercentage < 80
-        ) {
+    override suspend fun checkAndEmitAlarms(state: BatteryState) {
+        val pct = state.batteryPercentage
+
+        // 80% alarm — only when actively charging AND just crossed the threshold
+        if (pct >= 80 && state.isCharging && previousBatteryPercentage in 0..79) {
             _alarmEventFlow.emit(BatteryAlarmEvent.ChargedTo80())
         }
 
-        // 20% alarm - only when discharging
-        if (state.batteryPercentage <= 20 &&
-            !state.isCharging &&
-            previousBatteryPercentage > 20
-        ) {
+        // 20% alarm — only when discharging AND just crossed the threshold
+        if (pct <= 20 && !state.isCharging && previousBatteryPercentage > 20) {
             _alarmEventFlow.emit(BatteryAlarmEvent.LowBatteryAt20())
         }
 
-        // 15-second charger check logic
+        // 15-second charger switch check
         if (state.isChargerConnectedButNotCharging) {
             if (!previousPlugged) {
-                // Just plugged in, start timer
+                // Just plugged in — start 15-second timer
                 chargerPluggedTime = System.currentTimeMillis()
-            } else {
-                // Already plugged, check if 15 seconds have passed
-                val elapsedTime = System.currentTimeMillis() - chargerPluggedTime
-                if (elapsedTime >= 15000) { // 15 seconds
+            } else if (chargerPluggedTime > 0) {
+                val elapsed = System.currentTimeMillis() - chargerPluggedTime
+                if (elapsed >= 15_000L) {
                     _alarmEventFlow.emit(BatteryAlarmEvent.CheckChargerSwitch())
-                    chargerPluggedTime = 0L // Reset timer to avoid duplicate alarms
+                    chargerPluggedTime = 0L // reset to avoid repeated firing
                 }
             }
         } else {
-            // Charger disconnected or charging started, reset timer
-            chargerPluggedTime = 0L
+            chargerPluggedTime = 0L // reset when charging starts or unplugged
         }
 
-        // Update previous state
-        previousBatteryPercentage = state.batteryPercentage
-        previousCharging = state.isCharging
+        previousBatteryPercentage = pct
         previousPlugged = state.isPlugged
     }
 }

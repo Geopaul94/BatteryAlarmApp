@@ -7,6 +7,7 @@ import com.example.batteryalarm.domain.model.BatteryState
 import com.example.batteryalarm.domain.repository.BatteryRepository
 import com.example.batteryalarm.notifications.AlarmNotificationManager
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
@@ -14,8 +15,10 @@ import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 /**
- * ViewModel for battery monitoring
- * Responsibility: Manage UI state and communicate with repository
+ * ViewModel for battery monitoring.
+ *
+ * Collects the real-time callbackFlow from repository and
+ * exposes it as a StateFlow for the Compose UI to observe.
  */
 @HiltViewModel
 class BatteryViewModel @Inject constructor(
@@ -23,27 +26,49 @@ class BatteryViewModel @Inject constructor(
     private val alarmNotificationManager: AlarmNotificationManager
 ) : ViewModel() {
 
-    // Observe battery state from repository
+    /**
+     * Live battery state — SharingStarted.WhileSubscribed keeps the
+     * BroadcastReceiver alive only while the UI is on screen.
+     * The 5_000ms timeout means it survives brief config changes (rotation).
+     */
     val batteryState: StateFlow<BatteryState> = batteryRepository.getBatteryStateFlow()
         .stateIn(
-            viewModelScope,
-            SharingStarted.Lazily,
-            BatteryState()
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = BatteryState()
         )
 
-    // Track monitoring state
-    private val _isMonitoring = kotlinx.coroutines.flow.MutableStateFlow(true)
-    val isMonitoring: StateFlow<Boolean> = _isMonitoring.stateIn(
-        viewModelScope,
-        SharingStarted.Lazily,
-        true
-    )
+    private val _isMonitoring = MutableStateFlow(true)
+    val isMonitoring: StateFlow<Boolean> = _isMonitoring
 
     init {
-        // Start monitoring when ViewModel is created
         startMonitoring()
+        collectAlarmEvents()
+        collectBatteryForAlarmChecks()
+    }
 
-        // Listen for alarm events and trigger notifications
+    /** Schedule WorkManager periodic job */
+    private fun startMonitoring() {
+        viewModelScope.launch {
+            batteryRepository.startMonitoring()
+            _isMonitoring.value = true
+        }
+    }
+
+    /**
+     * Also check alarms on every real-time battery change.
+     * WorkManager handles background; this handles foreground.
+     */
+    private fun collectBatteryForAlarmChecks() {
+        viewModelScope.launch {
+            batteryRepository.getBatteryStateFlow().collect { state ->
+                batteryRepository.checkAndEmitAlarms(state)
+            }
+        }
+    }
+
+    /** Listen for alarm events → trigger notification */
+    private fun collectAlarmEvents() {
         viewModelScope.launch {
             batteryRepository.getAlarmEventFlow().collect { event ->
                 handleAlarmEvent(event)
@@ -51,44 +76,22 @@ class BatteryViewModel @Inject constructor(
         }
     }
 
-    private fun startMonitoring() {
-        viewModelScope.launch {
-            batteryRepository.startMonitoring()
-            _isMonitoring.emit(true)
-        }
-    }
-
     fun stopMonitoring() {
         viewModelScope.launch {
             batteryRepository.stopMonitoring()
-            _isMonitoring.emit(false)
+            _isMonitoring.value = false
         }
     }
 
     fun toggleMonitoring() {
-        viewModelScope.launch {
-            if (isMonitoring.value) {
-                stopMonitoring()
-            } else {
-                startMonitoring()
-            }
-        }
+        if (_isMonitoring.value) stopMonitoring() else startMonitoring()
     }
 
-    /**
-     * Handle alarm events by showing notifications
-     */
     private fun handleAlarmEvent(event: BatteryAlarmEvent) {
         when (event) {
-            is BatteryAlarmEvent.ChargedTo80 -> {
-                alarmNotificationManager.showChargedTo80Alarm()
-            }
-            is BatteryAlarmEvent.LowBatteryAt20 -> {
-                alarmNotificationManager.showLowBatteryAlarm()
-            }
-            is BatteryAlarmEvent.CheckChargerSwitch -> {
-                alarmNotificationManager.showCheckChargerSwitchAlarm()
-            }
+            is BatteryAlarmEvent.ChargedTo80    -> alarmNotificationManager.showChargedTo80Alarm()
+            is BatteryAlarmEvent.LowBatteryAt20 -> alarmNotificationManager.showLowBatteryAlarm()
+            is BatteryAlarmEvent.CheckChargerSwitch -> alarmNotificationManager.showCheckChargerSwitchAlarm()
         }
     }
 }
